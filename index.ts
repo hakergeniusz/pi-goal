@@ -1,383 +1,460 @@
 /**
- * goal — an agent that says "done" is not done until a verifier agrees.
+ * pi-goal v0.2 — Claude Code /goal behavior for pi.
  *
- * The failure mode this extension exists for: the task spans many steps, the
- * agent completes the easy 90%, declares success, and the turn ends with the
- * goal half-met. Nobody is checking the claim against the goal — except you,
- * after the fact.
+ * /goal <condition> arms a session goal and immediately starts a turn with
+ * the condition as the directive. After every turn a cheap verifier model
+ * judges the condition against the transcript:
+ *   NOT_DONE    → continue with the reason as guidance for the next turn
+ *   DONE        → record an achieved entry, clear the goal
+ *   UNREACHABLE → record a failed entry, clear the goal
+ * No tool use for several turns pauses the loop but KEEPS the goal;
+ * evaluation resumes on the next prompt. Turn failures keep the goal armed.
+ * Goal state persists in session custom entries, so resume restores it.
  *
- * Claude Code solves this with stop hooks: when the agent finishes, a hook can
- * block the stop and hand back a reason, and the query loop simply keeps going
- * (src/query/stopHooks.ts: a blocking hook becomes an injected user message
- * and the run continues). pi has the same seam — `agent_before_settle` is the
- * final actionable boundary before a run ends, and the handler may append
- * entries and set `continue = true` to request exactly one more run.
- *
- * ## How this extension uses the seam
- *
- *   /goal <text>     arm a goal
- *   /goal            show it; /goal clear dismiss it
- *
- * Every time the agent settles while a goal is armed, a verifier model call
- * receives the goal plus a trimmed digest of the transcript and must answer
- * `VERDICT: DONE | NOT_DONE | UNREACHABLE` with a reason:
- *
- *   - DONE        → goal cleared, normal settle. The claim survived an audit.
- *   - NOT_DONE    → the run is continued with the verifier's reason injected
- *                   as a visible message, so the next turn starts from what
- *                   is actually missing instead of the agent's own summary.
- *   - UNREACHABLE → goal cleared with the blocker reported. A verifier that
- *                   cannot be satisfied must say so rather than loop.
- *
- * Two guards keep the loop honest. A verifier that returns the *same* blocker
- * twice in a row is treated as evidence the agent cannot make progress — the
- * goal is cleared with that blocker reported, rather than burning turns on a
- * treadmill. And a check ceiling (default 12) bounds the whole loop per goal.
- *
- * The checker is a nested `streamSimple` call on the active model (or
- * PI_GOAL_CHECK_MODEL) with reasoning off — deliberately cheap, since it runs
- * after every settle while a goal is armed. Its failure is fail-open: a broken
- * verifier must never trap a finished run, so errors settle normally.
+ * Model: PI_GOAL_CHECK_MODEL (default: the session's active model — set this
+ * to a small fast model to mirror Claude Code's evaluator cost profile).
+ * Env: PI_GOAL_MAX_CHECKS (default 12), PI_GOAL_STALL_TURNS (default 3),
+ * PI_GOAL_OFF=1 disables.
  */
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type {
+	AgentBeforeSettleEvent,
+	BoundaryResult,
+	CustomEntry,
+	CustomMessageEntryDraft,
+	ExtensionAPI,
+	ExtensionCommandContext,
+	ExtensionContext,
+	TurnEndEvent,
+} from "@earendil-works/pi-coding-agent";
 
 const MAX_CHECKS = Number(process.env.PI_GOAL_MAX_CHECKS ?? 12);
 const CHECK_MODEL = process.env.PI_GOAL_CHECK_MODEL?.trim() || undefined;
+const STALL_TURNS = Number(process.env.PI_GOAL_STALL_TURNS ?? 3);
 const OFF = process.env.PI_GOAL_OFF === "1";
-/** Same normalized blocker twice in a row → declare no progress. */
-const NO_PROGRESS_STREAK = 2;
 
-/** Per-message truncation in the verifier's transcript digest. */
 const DIGEST_MSG_CHARS = 400;
-/** Cap on the whole digest sent to the verifier. */
 const DIGEST_MAX_CHARS = 10_000;
-/** Digest window: only the tail of the transcript is relevant. */
 const DIGEST_LAST_MESSAGES = 40;
+const STORE_TYPE = "pi-goal";
 
-/** Structural shapes for what pi hands us, kept loose on purpose: the
- * extension must survive minor version drift in the event types. */
-interface LlmMessage {
-	role?: string;
-	content?: unknown;
-	toolCallId?: string;
-	toolName?: string;
-}
-interface SettleEvent {
-	outcome?: string;
-	continue?: boolean;
-	entries?: unknown[];
-	context?: {
-		canContinue?: boolean;
-		llmMessages?: LlmMessage[];
-	};
-}
-interface UiContext {
-	ui?: {
-		notify?: (text: string, level?: string) => void;
-		setStatus?: (key: string, text: string) => void;
-	};
-}
-interface StreamChunk {
-	type?: string;
-	message?: { content?: unknown };
-	error?: unknown;
+const CLEAR_ALIASES = new Set(["clear", "stop", "off", "reset", "none", "cancel"]);
+
+type Verdict = "DONE" | "NOT_DONE" | "UNREACHABLE";
+
+interface GoalState {
+	goal: string | null;
+	checks: number; // verifier evaluations performed
+	turns: number; // turns evaluated while armed
+	startedAt: number;
+	spentTokens: number; // verifier tokens (best effort)
+	lastReason: string | null;
+	achieved: string | null; // last achieved condition, for status
+	idleTurns: number; // consecutive evaluated turns with no tool use
+	failures: number; // consecutive verifier errors
+	evalPending: boolean; // a turn ended without evaluation (settle backstop)
+	deferredNotice: boolean; // background-deferral notice already shown
 }
 
-const CHECKER_SYSTEM = [
-	"You are a strict completion verifier for a coding agent. You are given a goal",
-	"and a digest of what the agent actually did. Decide from evidence in the",
-	"digest, not from the agent's own claims of success.",
-	"",
-	"Answer in exactly this format, nothing else:",
-	"VERDICT: DONE | NOT_DONE | UNREACHABLE",
-	"<1-3 sentences of reason>",
-	"",
-	"VERDICT meaning:",
-	"- DONE: the goal is fully accomplished per the evidence.",
-	"- NOT_DONE: any part of the goal is unmet, unverified, or only claimed.",
-	"  Name the concrete missing steps in the reason.",
-	"- UNREACHABLE: the goal cannot be achieved in this environment",
-	"  (missing access, impossible request). Say what blocks it.",
-].join("\n");
+const freshState = (): GoalState => ({
+	goal: null,
+	checks: 0,
+	turns: 0,
+	startedAt: 0,
+	spentTokens: 0,
+	lastReason: null,
+	achieved: null,
+	idleTurns: 0,
+	failures: 0,
+	evalPending: false,
+	deferredNotice: false,
+});
 
-function fmtStatus(state: { goal: string | null; checks: number }): string {
-	if (!state.goal) return "goal: none";
-	const short = state.goal.length > 40 ? `${state.goal.slice(0, 39)}…` : state.goal;
-	return `goal: ${short} (check ${state.checks}/${MAX_CHECKS})`;
+function fmtElapsed(ms: number): string {
+	const s = Math.max(0, Math.round(ms / 1000));
+	if (s < 60) return `${s}s`;
+	const m = Math.floor(s / 60);
+	if (m < 60) return `${m}m${s % 60 ? `${s % 60}s` : ""}`;
+	return `${Math.floor(m / 60)}h${m % 60 ? `${m % 60}m` : ""}`;
 }
 
-/** Flatten a message's text/tool blocks into a short one-line-ish digest. */
-function digestMessage(m: LlmMessage): string {
-	const blocks = Array.isArray(m.content) ? (m.content as Record<string, unknown>[]) : [];
-	const text = (limit: number): string => {
-		const joined = blocks
-			.filter((b) => b?.type === "text")
-			.map((b) => String((b as { text?: string }).text ?? ""))
-			.join(" ")
-			.replace(/\s+/g, " ")
-			.trim();
-		return joined.length > limit ? `${joined.slice(0, limit - 1)}…` : joined;
-	};
-	if (m.role === "user") return `USER: ${text(DIGEST_MSG_CHARS)}`;
-	if (m.role === "assistant") {
-		const calls = blocks
-			.filter((b) => b?.type === "toolCall")
-			.map((b) => {
-				const tc = b as { name?: string; arguments?: Record<string, unknown> };
-				const arg = tc.arguments?.command ?? tc.arguments?.path ?? tc.arguments?.file_path ?? "";
-				return `${tc.name ?? "tool"}(${String(arg).slice(0, 80)})`;
-			})
-			.join("; ");
-		const prose = text(DIGEST_MSG_CHARS);
-		return `ASSISTANT: ${[prose, calls].filter(Boolean).join(" | ")}`;
+function fmtTokens(n: number): string {
+	return n >= 1000 ? `~${(n / 1000).toFixed(1)}k` : `${n}`;
+}
+
+/** Compact a message for the digest; tool calls keep name + short args. */
+function compactMessage(m: unknown): string {
+	if (typeof m === "string") return m.slice(0, DIGEST_MSG_CHARS);
+	if (m === null || typeof m !== "object") return String(m).slice(0, DIGEST_MSG_CHARS);
+	const msg = m as { role?: unknown; content?: unknown; toolName?: unknown };
+	const role = typeof msg.role === "string" ? msg.role : "message";
+	const c = msg.content;
+	if (typeof c === "string") return `${role}: ${c.slice(0, DIGEST_MSG_CHARS)}`;
+	if (!Array.isArray(c))
+		return `${role}: ${JSON.stringify(c ?? msg.toolName ?? "").slice(0, DIGEST_MSG_CHARS)}`;
+	const parts: string[] = [];
+	for (const b of c) {
+		if (typeof b === "string") {
+			parts.push(b.slice(0, DIGEST_MSG_CHARS));
+			continue;
+		}
+		if (b === null || typeof b !== "object") continue;
+		const block = b as Record<string, unknown>;
+		if (block.type === "text" && typeof block.text === "string")
+			parts.push(block.text.slice(0, DIGEST_MSG_CHARS));
+		else if (block.type === "toolCall")
+			parts.push(
+				`[tool ${String(block.name ?? "?")}: ${JSON.stringify(block.arguments ?? {}).slice(0, 160)}]`,
+			);
+		else if (block.type === "toolResult" || typeof block.toolName === "string")
+			parts.push(
+				`[result ${String(block.toolName ?? "?")}: ${JSON.stringify(block.content ?? block.text ?? "").slice(0, 160)}]`,
+			);
 	}
-	if (m.role === "toolResult") return `TOOL ${m.toolName ?? ""}: ${text(200)}`;
-	return `${m.role ?? "?"}`.slice(0, DIGEST_MSG_CHARS);
+	return `${role}: ${parts.join(" | ").slice(0, DIGEST_MSG_CHARS * 2)}`;
 }
 
-function buildDigest(llmMessages: LlmMessage[] | undefined): string {
-	const messages = Array.isArray(llmMessages) ? llmMessages.slice(-DIGEST_LAST_MESSAGES) : [];
-	const lines = messages.map(digestMessage);
+/** Last N messages, newest last, hard-capped so the check stays cheap. */
+function buildDigest(llmMessages: unknown): string {
+	const arr = Array.isArray(llmMessages) ? llmMessages : [];
+	const lines = arr.slice(-DIGEST_LAST_MESSAGES).map(compactMessage);
 	let digest = lines.join("\n");
-	if (digest.length > DIGEST_MAX_CHARS) {
-		digest = digest.slice(digest.length - DIGEST_MAX_CHARS);
-		// Re-align to a message boundary so the verifier never sees a half line.
-		digest = digest.slice(digest.indexOf("\n") + 1);
-	}
-	return digest || "(no transcript)";
+	if (digest.length > DIGEST_MAX_CHARS)
+		digest = `…(truncated)…\n${digest.slice(-DIGEST_MAX_CHARS)}`;
+	return digest;
 }
 
-function parseVerdict(output: string): { verdict: "DONE" | "NOT_DONE" | "UNREACHABLE"; reason: string } | null {
-	const m = output.match(/VERDICT:\s*(DONE|NOT_DONE|UNREACHABLE)/i);
-	if (m) {
-		const verdict = m[1].toUpperCase().replace("_", "_") as "DONE" | "NOT_DONE" | "UNREACHABLE";
-		const rest = output.slice((m.index ?? 0) + m[0].length).trim();
-		return { verdict, reason: rest || "(no reason given)" };
-	}
-	// Loose fallbacks for models that ignore the format.
-	if (/unreachable|impossible|cannot be (?:done|achieved|reached)/i.test(output))
-		return { verdict: "UNREACHABLE", reason: output.trim().slice(0, 300) };
-	if (/not[ _-]?done|incomplete|not yet/i.test(output))
-		return { verdict: "NOT_DONE", reason: output.trim().slice(0, 300) };
-	if (/\bdone\b|complete/i.test(output)) return { verdict: "DONE", reason: output.trim().slice(0, 300) };
-	return null;
+function parseVerdict(text: string): { verdict: Verdict; reason: string } | null {
+	const m = text.match(/VERDICT\s*:\s*(DONE|NOT_DONE|UNREACHABLE)/i);
+	if (!m) return null;
+	const firstLine = text
+		.split("\n")
+		.map((l) => l.trim())
+		.filter(Boolean)
+		.slice(0, 3)
+		.join(" ");
+	return { verdict: m[1].toUpperCase() as Verdict, reason: firstLine.slice(0, 300) };
 }
 
-function normalizeReason(reason: string): string {
-	return reason.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim().slice(0, 200);
+function hasToolUse(event: TurnEndEvent | AgentBeforeSettleEvent): boolean {
+	if ("toolResults" in event && Array.isArray(event.toolResults) && event.toolResults.length > 0)
+		return true;
+	const msg = ("message" in event ? event.message : undefined) as { content?: unknown } | null;
+	if (msg && Array.isArray(msg.content))
+		return msg.content.some(
+			(b) => b !== null && typeof b === "object" && (b as { type?: unknown }).type === "toolCall",
+		);
+	return false;
 }
 
-/** Extract the checker's text output from a finished stream message. */
-function extractText(message: { content?: unknown }): string {
-	const blocks = Array.isArray(message.content) ? (message.content as Record<string, unknown>[]) : [];
-	return blocks
-		.filter((b) => b?.type === "text")
-		.map((b) => String((b as { text?: string }).text ?? ""))
-		.join("\n")
-		.trim();
-}
+export default function activate(pi: ExtensionAPI) {
+	if (OFF) return;
+	const state: GoalState = freshState();
 
-export default async function (pi: ExtensionAPI) {
-	const state = {
-		goal: null as string | null,
-		checks: 0,
-		lastReasonKey: null as string | null,
-		sameStreak: 0,
-		failures: 0,
-	};
+	const snapshot = () => ({
+		v: 1,
+		goal: state.goal,
+		checks: state.checks,
+		turns: state.turns,
+		startedAt: state.startedAt,
+		spentTokens: state.spentTokens,
+		lastReason: state.lastReason,
+		achieved: state.achieved,
+	});
 
-	const notify = (ctx: UiContext, text: string) => {
+	function persist() {
 		try {
-			ctx.ui?.notify?.(text, "info");
+			pi.appendEntry(STORE_TYPE, snapshot());
 		} catch {
-			console.log(`[pi-goal] ${text}`);
+			/* persistence is best effort */
 		}
-	};
-	const setStatus = (ctx: UiContext) => {
+	}
+
+	function statusLine(): string {
+		if (!state.goal)
+			return state.achieved ? `goal: none (last achieved: ${state.achieved})` : "goal: none";
+		const elapsed = fmtElapsed(Date.now() - state.startedAt);
+		const last = state.lastReason ? `\nlast: ${state.lastReason}` : "";
+		return (
+			`goal: ${state.goal}\nelapsed ${elapsed}, turns ${state.turns}, ` +
+			`checks ${state.checks}/${MAX_CHECKS}, eval tokens ${fmtTokens(state.spentTokens)}${last}`
+		);
+	}
+
+	function clearGoal() {
+		state.goal = null;
+		state.checks = 0;
+		state.turns = 0;
+		state.lastReason = null;
+		state.idleTurns = 0;
+		state.failures = 0;
+		state.evalPending = false;
+		persist();
+	}
+
+	/** Verifier model: PI_GOAL_CHECK_MODEL (provider:id or bare id) or the active model. */
+	function resolveCheckModel(ctx: ExtensionContext): ExtensionContext["model"] {
+		const active = ctx.model;
+		if (!CHECK_MODEL) return active;
 		try {
-			ctx.ui?.setStatus?.("goal", fmtStatus(state));
-		} catch {
-			// Status must never break the boundary.
-		}
-	};
-
-	/** One verifier call. Returns the parsed verdict, or null when the call
-	 * failed (fail-open: the caller lets the run settle). */
-	async function verify(
-		ctx: unknown,
-	): Promise<{ verdict: "DONE" | "NOT_DONE" | "UNREACHABLE"; reason: string } | null> {
-		const anyCtx = ctx as {
-			model?: unknown;
-			modelRegistry?: {
-				streamSimple?: (model: unknown, context: unknown, options?: unknown) => AsyncIterable<StreamChunk>;
-			};
-		};
-		const model = anyCtx?.model;
-		const stream = anyCtx?.modelRegistry?.streamSimple;
-		if (!model || typeof stream !== "function") return null;
-
-		// Resolving the checker model here (per check, not per goal) means
-		// runtime-registered providers and model switches mid-session are fine.
-		let checkerModel: unknown = model;
-		if (CHECK_MODEL) {
-			const slash = CHECK_MODEL.indexOf("/");
-			checkerModel =
-				slash === -1
-					? { provider: "", id: CHECK_MODEL }
-					: { provider: CHECK_MODEL.slice(0, slash), id: CHECK_MODEL.slice(slash + 1) };
-		}
-
-		const userText = [
-			`GOAL: ${state.goal}`,
-			"",
-			"TRANSCRIPT DIGEST (most recent last):",
-			buildDigest((ctx as { settleEvent?: SettleEvent }).settleEvent?.context?.llmMessages),
-		].join("\n");
-
-		try {
-			const events = stream.call(anyCtx.modelRegistry, checkerModel, {
-				systemPrompt: CHECKER_SYSTEM,
-				messages: [{ role: "user", content: [{ type: "text", text: userText }] }],
-			}, { reasoning: "off" });
-			let final: StreamChunk | null = null;
-			for await (const chunk of events) {
-				if (chunk?.type === "done" || chunk?.type === "error") final = chunk;
+			const reg = ctx.modelRegistry;
+			if (!reg) return active;
+			const sep = CHECK_MODEL.indexOf(":");
+			if (sep > 0) {
+				const found = reg.find(CHECK_MODEL.slice(0, sep), CHECK_MODEL.slice(sep + 1));
+				if (found) return found;
+			} else {
+				const match = reg.getAll().find((m) => m.id === CHECK_MODEL);
+				if (match) return match;
 			}
-			if (!final || final.type !== "done") return null;
-			const output = extractText(final.message ?? {});
-			return output ? parseVerdict(output) : null;
 		} catch {
-			return null;
+			/* fall through to the active model */
 		}
+		return active;
+	}
+	/** Verifier call. Returns null when the check must fail open (settle). */
+	async function verify(
+		event: TurnEndEvent | AgentBeforeSettleEvent,
+		ctx: ExtensionContext,
+	): Promise<{ verdict: Verdict; reason: string } | null> {
+		const model = resolveCheckModel(ctx);
+		const stream = ctx.modelRegistry?.streamSimple;
+		if (!model || !stream) return null;
+		const digest = buildDigest(event.context?.llmMessages);
+		const elapsed = fmtElapsed(Date.now() - state.startedAt);
+		const userText =
+			`You are a goal evaluator. Judge ONLY what the transcript below demonstrates — do not assume unseen work.\n` +
+			`GOAL: ${state.goal}\n` +
+			`PROGRESS: turn ${state.turns + 1} of evaluation, ${state.checks} checks used of ${MAX_CHECKS} max, elapsed ${elapsed}.\n` +
+			`Reply with exactly one line "VERDICT: DONE" (transcript proves the goal), ` +
+			`"VERDICT: NOT_DONE" (work remains), or "VERDICT: UNREACHABLE" (can never be satisfied), ` +
+			`followed by one short sentence of evidence or the next missing piece.\n` +
+			`A turn/time clause in the goal ("stop after N turns") counts as a binding bound: judge it from this PROGRESS line.\n` +
+			`TRANSCRIPT DIGEST (oldest first):\n${digest}`;
+		let final: { content?: unknown; usage?: { input?: number; output?: number } } | undefined;
+		for await (const chunk of stream(
+			model,
+			{ messages: [{ role: "user", content: [{ type: "text", text: userText }], timestamp: Date.now() }] },
+			{ reasoning: "minimal" },
+		)) {
+			if (chunk.type === "done") {
+				final = chunk.message;
+				break;
+			}
+		}
+		const content = final?.content;
+		const text = Array.isArray(content)
+			? content
+					.filter((b): b is { type: string; text: string } =>
+						b !== null && typeof b === "object" &&
+						(b as { type?: unknown }).type === "text" &&
+						typeof (b as { text?: unknown }).text === "string",
+					)
+					.map((b) => b.text)
+					.join("\n")
+			: "";
+		const usage = final?.usage;
+		if (usage) state.spentTokens += (usage.input ?? 0) + (usage.output ?? 0);
+		state.checks++;
+		return parseVerdict(text);
 	}
 
-	pi.on("agent_before_settle", async (event, ctx) => {
-		const settle = event as unknown as SettleEvent;
-		if (OFF || !state.goal) return;
-		// Only audit clean finishes: aborts and provider errors must settle
-		// untouched, and pi's own canContinue guard wins over ours.
-		if (settle.outcome !== "completed" || !settle.context?.canContinue) return;
+	/**
+	 * Shared evaluation used by turn_end (primary) and agent_before_settle
+	 * (backstop for turns that went unevaluated, e.g. deferred background
+	 * turns). Mutates the event and returns the same result for callers that
+	 * prefer the BoundaryResult contract.
+	 */
+	async function evaluate(
+		event: TurnEndEvent | AgentBeforeSettleEvent,
+		ctx: ExtensionContext,
+	): Promise<BoundaryResult> {
+		if (!state.goal) return {};
+		if (event.outcome === "aborted") return {};
+		if (event.outcome === "error") {
+			// Turn failed: keep the goal armed, pause the loop. The next
+			// user message resumes evaluation.
+			ctx.ui?.notify?.(`pi-goal: turn failed — goal kept: ${state.goal}. Send a message to resume.`);
+			return {};
+		}
+		if (event.context && event.context.canContinue === false) return {};
+		if (Array.isArray(event.context?.pendingMessages) && event.context.pendingMessages.length > 0) {
+			// Background work still running: defer evaluation to a later turn.
+			if (!state.deferredNotice) {
+				ctx.ui?.notify?.("pi-goal: background work running — evaluation deferred to a later turn.");
+				state.deferredNotice = true;
+			}
+			return {};
+		}
+		state.deferredNotice = false;
 
-		state.checks++;
-		const ctxAny = ctx as UiContext & { settleEvent?: SettleEvent };
-		ctxAny.settleEvent = settle;
-		setStatus(ctxAny);
-
-		const verdict = await verify(ctx);
-		if (!verdict) {
-			// Fail-open. Count consecutive failures so a permanently broken
-			// checker stops spamming the transcript with failed audits.
+		let parsed: { verdict: Verdict; reason: string } | null = null;
+		try {
+			parsed = await verify(event, ctx);
+		} catch {
+			parsed = null;
+		}
+		state.evalPending = false;
+		if (!parsed) {
 			state.failures++;
 			if (state.failures >= 3) {
-				notify(ctxAny, `pi-goal: verifier failed ${state.failures}× — goal paused, run /goal <text> to re-arm`);
-				state.goal = null;
-				setStatus(ctxAny);
+				ctx.ui?.notify?.(`pi-goal: goal check failed ${state.failures}x — goal paused, re-arm with /goal.`);
+				clearGoal();
 			} else {
-				notify(ctxAny, "pi-goal: goal check failed — settling; will re-check next time");
+				ctx.ui?.notify?.("pi-goal: goal check failed — settling (fail open).");
 			}
-			return;
+			return {};
 		}
 		state.failures = 0;
+		state.turns++;
+		state.lastReason = parsed.reason;
 
-		if (verdict.verdict === "DONE") {
-			const checks = state.checks;
-			state.goal = null;
-			state.checks = 0;
-			state.lastReasonKey = null;
-			state.sameStreak = 0;
-			setStatus(ctxAny);
-			notify(ctxAny, `pi-goal: goal reached and verified ✓ (${checks} check${checks === 1 ? "" : "s"})`);
-			return;
+		const pushEntry = (content: string) => {
+			const entry: CustomMessageEntryDraft = {
+				type: "custom_message",
+				customType: STORE_TYPE,
+				content,
+				display: true,
+			};
+			event.entries.push(entry);
+		};
+
+		if (parsed.verdict === "DONE") {
+			const doneMsg =
+				`[pi-goal] ✓ Goal achieved in ${state.turns} turn(s) / ${state.checks} check(s): ${state.goal}\n` +
+				`Evidence: ${parsed.reason}`;
+			pushEntry(doneMsg);
+			ctx.ui?.notify?.(`pi-goal: goal reached — ${state.goal}`);
+			state.achieved = state.goal;
+			clearGoal();
+			ctx.ui?.setStatus?.("pi-goal", undefined);
+			if (event.entries && event.continue !== undefined) event.continue = false;
+			return { entries: event.entries, continue: false };
 		}
 
-		if (verdict.verdict === "UNREACHABLE") {
-			state.goal = null;
-			state.checks = 0;
-			state.lastReasonKey = null;
-			state.sameStreak = 0;
-			setStatus(ctxAny);
-			notify(ctxAny, `pi-goal: goal marked unreachable — ${verdict.reason}`);
-			return;
+		if (parsed.verdict === "UNREACHABLE") {
+			const failMsg = `[pi-goal] ✗ Goal failed (unreachable): ${state.goal}\nBlocker: ${parsed.reason}`;
+			pushEntry(failMsg);
+			ctx.ui?.notify?.(`pi-goal: goal unreachable — ${parsed.reason}`);
+			clearGoal();
+			ctx.ui?.setStatus?.("pi-goal", undefined);
+			if (event.continue !== undefined) event.continue = false;
+			return { entries: event.entries, continue: false };
 		}
 
-		// NOT_DONE — decide between "keep pushing" and "no progress".
-		// The same normalized blocker on two consecutive checks means the
-		// agent is on a treadmill, not making progress.
-		const reasonKey = normalizeReason(verdict.reason);
-		if (reasonKey && reasonKey === state.lastReasonKey) {
-			state.sameStreak++;
-		} else {
-			state.sameStreak = 0;
-			state.lastReasonKey = reasonKey;
-		}
-		if (state.sameStreak >= NO_PROGRESS_STREAK - 1) {
-			const blocker = verdict.reason;
-			state.goal = null;
-			state.checks = 0;
-			state.lastReasonKey = null;
-			state.sameStreak = 0;
-			setStatus(ctxAny);
-			notify(ctxAny, `pi-goal: no progress toward the goal — clearing it. Repeating blocker: ${blocker}`);
-			return;
+		// NOT_DONE: stall detection first — no tool use for several turns
+		// pauses the loop but KEEPS the goal; the next prompt resumes it.
+		state.idleTurns = hasToolUse(event) ? 0 : state.idleTurns + 1;
+		if (state.idleTurns >= STALL_TURNS) {
+			state.idleTurns = 0;
+			ctx.ui?.notify?.(
+				`pi-goal: no progress for ${STALL_TURNS} turns (no tool use) — Paused with goal still set: ${state.goal}. Send a message to resume.`,
+			);
+			if (event.continue !== undefined) event.continue = false;
+			return { entries: event.entries, continue: false };
 		}
 
 		if (state.checks >= MAX_CHECKS) {
-			const goal = state.goal;
-			state.goal = null;
-			state.checks = 0;
-			state.lastReasonKey = null;
-			state.sameStreak = 0;
-			setStatus(ctxAny);
-			notify(ctxAny, `pi-goal: gave up after ${MAX_CHECKS} checks — goal cleared (was: ${goal})`);
-			return;
+			ctx.ui?.notify?.(
+				`pi-goal: gave up after ${MAX_CHECKS} checks — still not done: ${state.goal}. Re-arm with /goal to continue.`,
+			);
+			clearGoal();
+			ctx.ui?.setStatus?.("pi-goal", undefined);
+			if (event.continue !== undefined) event.continue = false;
+			return { entries: event.entries, continue: false };
 		}
 
-		// The Claude Code stop-hook move: block the stop, inject the reason,
-		// let the loop continue from what is actually missing.
-		settle.continue = true;
-		settle.entries?.push({
-			type: "custom_message",
-			customType: "pi-goal",
-			content:
-				`[pi-goal] The goal is NOT reached yet — keep working.\n` +
-				`Goal: ${state.goal}\n` +
-				`Verifier: ${verdict.reason}\n` +
-				`Address the missing parts now. When you believe the goal is met, just finish; it will be verified again.`,
-			display: true,
-		} as never);
+		const guidance =
+			`[pi-goal] Goal not yet met (turn ${state.turns}, check ${state.checks}/${MAX_CHECKS}): ${state.goal}\n` +
+			`Evaluator: ${parsed.reason}\n` +
+			`Keep working toward the goal. State the verifiable outcome (test output, build exit code, file state) in your reply.`;
+		pushEntry(guidance);
+		if (event.continue !== undefined) event.continue = true;
+		return { entries: event.entries, continue: true };
+	}
+
+	pi.on("turn_start", async () => {
+		if (state.goal) state.evalPending = true;
+	});
+
+	pi.on("turn_end", async (event, ctx) => evaluate(event, ctx));
+
+	pi.on("agent_before_settle", async (event, ctx) => {
+		// Backstop: only evaluate when a turn went unevaluated (e.g. the
+		// turn_end check was deferred). Never double-check an evaluated turn.
+		if (!state.goal || !state.evalPending) return {};
+		return evaluate(event, ctx);
+	});
+
+	pi.on("session_start", async (_event, ctx) => {
+		try {
+			const branch = ctx.sessionManager.getBranch();
+			for (let i = branch.length - 1; i >= 0; i--) {
+				const e = branch[i] as Partial<CustomEntry> | undefined;
+				if (e?.type !== "custom" || e?.customType !== STORE_TYPE) continue;
+				const data = e.data as { goal?: unknown } | null;
+				if (data && typeof data.goal === "string" && data.goal.length > 0) {
+					state.goal = data.goal;
+					state.checks = 0;
+					state.turns = 0;
+					state.startedAt = Date.now();
+					state.spentTokens = 0;
+					state.lastReason = null;
+					state.idleTurns = 0;
+					state.failures = 0;
+					state.evalPending = false;
+					ctx.ui.notify(`pi-goal: resumed active goal — ${state.goal}`);
+				}
+				break; // latest pi-goal entry wins; cleared goals stay cleared
+			}
+		} catch {
+			/* restore is best effort */
+		}
 	});
 
 	pi.registerCommand("goal", {
-		description: "Set a goal the agent is held to: /goal <text> — /goal shows it — /goal clear dismisses it",
-		getArgumentCompletions: (prefix: string) => {
-			const subs = ["clear"].filter((s) => s.startsWith(prefix));
-			return subs.length > 0 ? subs.map((s) => ({ value: s, label: s })) : null;
-		},
-		handler: async (args, ctx) => {
-			const cmdCtx = ctx as UiContext;
+		description: "Set a completion condition; pi keeps working across turns until a verifier confirms it",
+		handler: async (args: string, ctx: ExtensionCommandContext) => {
+			const ui = ctx.ui;
 			const text = args.trim();
-			if (text.toLowerCase() === "clear") {
-				const had = state.goal;
-				state.goal = null;
-				state.checks = 0;
-				state.lastReasonKey = null;
-				state.sameStreak = 0;
-				state.failures = 0;
-				setStatus(cmdCtx);
-				notify(cmdCtx, had ? `pi-goal: goal cleared (was: ${had})` : "pi-goal: no goal set");
-				return;
-			}
 			if (!text) {
-				notify(cmdCtx, state.goal ? fmtStatus(state) : "pi-goal: no goal set. Usage: /goal <text>");
+				ui.notify(state.goal ? statusLine() : "goal: no goal set");
 				return;
 			}
+			const word = text.split(/\s+/)[0].toLowerCase();
+			if (CLEAR_ALIASES.has(word) && text.split(/\s+/).length === 1) {
+				if (state.goal) ui.notify(`Goal cleared: ${state.goal}`);
+				else ui.notify("goal: no goal set");
+				clearGoal();
+				ui.setStatus("pi-goal", undefined);
+				return;
+			}
+			if (text.length > 4000) {
+				ui.notify("pi-goal: condition too long (max 4000 chars).");
+				return;
+			}
+			if (state.goal) ui.notify(`pi-goal: replacing active goal — ${state.goal}`);
 			state.goal = text;
 			state.checks = 0;
-			state.lastReasonKey = null;
-			state.sameStreak = 0;
+			state.turns = 0;
+			state.startedAt = Date.now();
+			state.spentTokens = 0;
+			state.lastReason = null;
+			state.idleTurns = 0;
 			state.failures = 0;
-			setStatus(cmdCtx);
-			notify(cmdCtx, `pi-goal: goal armed — the agent will be verified against it on every finish:\n${text}`);
+			state.evalPending = false;
+			persist();
+			ui.notify(`pi-goal: goal set — ${text}`);
+			ui.setStatus("pi-goal", `◎ goal: ${text.slice(0, 60)}`);
+			// Setting a goal starts a turn immediately with the condition itself as the directive.
+			try {
+				const idle = ctx.isIdle();
+				pi.sendUserMessage(
+					`[pi-goal] Work toward this goal until it is verifiably met. State the verifiable outcome in your replies.\nGoal: ${text}`,
+					idle ? undefined : { deliverAs: "followUp" },
+				);
+			} catch {
+				ui.notify("pi-goal: could not start the turn — send any message to begin.");
+			}
 		},
 	});
 }

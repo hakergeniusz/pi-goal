@@ -1,6 +1,6 @@
 {
 	"name": "pi-goal",
-	"version": "0.1.0",
+	"version": "0.2.0",
 	"description": "Set a goal with /goal; when the agent finishes, a verifier model checks whether it is actually done and forces continuation (or declares it unreachable) until it is.",
 	"type": "module",
 	"license": "MIT",
